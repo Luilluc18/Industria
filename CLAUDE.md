@@ -20,15 +20,33 @@ interna que hoje digita tudo no ERP na mão.
 - **Regra de ouro do MVP:** começa com revisão humana em 100% dos pedidos. O
   automático é liberado conforme a precisão do de-para sobe.
 
+## Princípio de arquitetura (config-ready, não config-completo)
+Um único motor genérico, adaptável por cliente via configuração — NUNCA código
+ramificado por ramo (nada de `if (ramo === 'alimentos')`). O código nasce
+preparado para receber config; o sistema de configuração COMPLETO (UI, seeds de
+vários ramos, painel admin) só é construído quando existir um 2º cliente de outro
+ramo. Até lá: config-ready, não config-completo.
+
+Dois eixos de adaptação, deliberadamente separados:
+- **Vertical** (alimentos, autopeças, ...) → resolvido por **config de tenant**
+  (`tenants.config`: ramo, dicionário, unidades). Sem código por setor.
+- **ERP** (Protheus, SAP, Bling, ...) → NÃO é config; é um **adaptador por ERP**
+  (padrão adapter). Hoje: só a interface + a implementação Protheus.
+
 ## Decisões a travar ANTES de codar
 1. **Modelo de embedding.** Define a dimensão da coluna `vector(N)` em `produtos`.
    Default atual no SQL: `1536` (compatível com text-embedding-3-small). Se for
    usar Voyage (provedor de embeddings recomendado pela Anthropic), **confirme a
    dimensão do modelo escolhido e ajuste `vector(N)`** — tem que bater exatamente.
-2. **`normalize()` é um contrato único.** A mesma função tem que gerar
-   `texto_normalizado` na **escrita** (registrar_apelido) e na **leitura**
-   (match_produto). Se divergir, o apelido salvo nunca casa com a busca. Trate
-   como um módulo compartilhado, com teste.
+2. **`normalize()` é um contrato único, dividido em duas responsabilidades.**
+   (a) Normalização UNIVERSAL e fixa (lowercase, `f_unaccent`, colapsar espaços,
+   trim, separar número/unidade) — não depende de setor.
+   (b) Expansão de abreviações/sinônimos via DICIONÁRIO injetado por parâmetro
+   (vem de `tenants.config.dicionario`), nunca embutido no código. Os termos de
+   alimentos (cx, fd, refri...) são só um SEED de exemplo (`normalize.seeds.ts`),
+   não o default. A MESMA `normalize()` roda na **escrita** (registrar_apelido) e
+   na **leitura** (match_produto); se divergir, o apelido salvo nunca casa com a
+   busca. Módulo compartilhado, com testes.
 
 ## Stack
 - **Frontend/Backend:** Next.js 15 (App Router)
@@ -50,6 +68,9 @@ Ver migrations:
   hnsw cosine) + RLS habilitado (políticas a definir conforme o auth).
 - `match_produto.sql` — funções `match_produto` (leitura/cascata) e
   `registrar_apelido` (escrita do loop de aprendizado).
+- `tenant_config.sql` — `tenants.config jsonb`: `{ ramo, dicionario, unidades }`.
+  Alimenta `normalize()` (dicionario) e o contexto do prompt de extração (ramo).
+  É o que torna o motor multi-vertical sem código por setor.
 
 Tudo é **multi-tenant**: toda query filtra por `tenant_id` e respeita RLS.
 
@@ -92,14 +113,35 @@ fila de revisão encolher com o uso).
 - (calibrar os cortes com pedidos reais; começar conservador)
 
 ## Ordem de construção
-1. `normalize()` + dicionário de abreviações (cx→caixa, fd→fardo, refri→
-   refrigerante, 2l→2 litros, dz→dúzia...) — **módulo compartilhado, com testes**
+1. `normalize()` — (a) universal fixa + (b) expansão por dicionário INJETADO.
+   Dicionário de alimentos só como SEED de exemplo (`normalize.seeds.ts`), nunca
+   o default. Módulo compartilhado, com testes (incl. dicionário vazio = só
+   universal). **[FEITO]**
 2. Tipos TypeScript + Zod do contrato do pedido
 3. Job que gera e popula os `embedding`s do catálogo (uma vez; cacheado)
 4. Orquestrador: `extrair → normalizar → match_produto → rotear`
 5. Tela de revisão humana (chama `registrar_apelido` ao confirmar/corrigir)
 6. Gerador do arquivo de importação do Protheus (layout definido com o cliente)
 7. Webhook do WhatsApp + fila assíncrona
+
+## Adaptador de ERP (padrão adapter)
+A geração do arquivo de importação é isolada atrás da interface `ErpAdapter`
+(`src/lib/erp`). Vertical é config; ERP é adapter. Implementação atual: Protheus
+(`ProtheusAdapter`). Outros ERPs (SAP, Bling) entram como novas implementações da
+MESMA interface, registradas em `getErpAdapter` — nunca ifs no orquestrador.
+
+## Camada de regras de validação (pluggável — FUTURA, não construir agora)
+Regras de negócio (pedido mínimo, múltiplo de caixa, preço por cliente, regras
+fiscais) NÃO viram ifs hardcoded nem cabem todas no jsonb de config. Serão uma
+camada de regras pluggável: cada regra é uma unidade plugável que recebe o pedido
+e devolve violações/ajustes. Apenas planejado; implementar quando necessário.
+
+## RLS — TODO OBRIGATÓRIO antes do go-live
+RLS está habilitado nas tabelas, mas SEM políticas → nega todo acesso. Em dev
+operamos com a service-role key (ignora RLS), por isso funciona agora. ANTES de
+qualquer go-live: criar as políticas de isolamento por `tenant_id` em `tenants`,
+`compradores`, `produtos` e `apelidos`
+(ex.: `using (tenant_id = (auth.jwt() ->> 'tenant_id')::uuid)`).
 
 ## Convenções (não violar)
 - A IA não inventa SKU; se em dúvida, sinaliza em `ambiguidades`.
